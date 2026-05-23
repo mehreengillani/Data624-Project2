@@ -1,0 +1,1193 @@
+---
+title: "pH Predictive Modeling for ABC Beverage"
+subtitle: "DATA 624 - Project 2"
+author: 
+  - "Mehreen Ali Gillani"
+  - "Sachi Kapoor"
+  - "Izza Khan"
+date: "2026-05-23"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      smooth_scroll: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+    code_download: true
+    theme: flatly
+    highlight: tango
+    fig_width: 7
+    fig_height: 5
+    fig_align: center
+    dev: png
+    df_print: kable
+    keep_md: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  out.width = "80%"
+)
+# Load required libraries
+library(tidyverse)
+library(readxl)   # For reading Excel files
+library(corrplot)
+library(ggplot2)
+library(car)
+library(caret)      # For data splitting and preprocessing
+library(randomForest) # Will try this model
+library(xgboost)    # Will try this too
+library(glmnet)
+library(gbm)
+library(rpart)
+library(rpart.plot)
+library(e1071)
+library(knitr)
+library(readr)      # For reading CSV
+library(dplyr)      # For data manipulation
+library(tidyr)      # For data cleaning
+library(writexl)    # For writing Excel files
+library(stringr)    # For string manipulation
+```
+# Executive Summary
+
+> **Note:** This is the technical report. For business-friendly recommendations, please refer to the separate "Non-Technical Report for Leadership."
+
+## Project Objective
+
+New regulations require ABC Beverage to understand manufacturing factors that control pH and provide a working predictive model. We have historical data from 2,567 production runs and must predict pH for 267 new runs.
+
+## Key Findings
+
+- **Random Forest** selected as final model (RMSE = 0.0921, MAE = 0.0685, R² = 0.726)
+- **Top 3 predictors:** Manufacturing Flow, Bowl Setpoint, Filler Level
+- **Brand matters:** Significant pH differences across brands (p < 0.001)
+- **Predictions delivered:** Excel file with 90% confidence intervals (±0.1514 pH)
+
+## Load Training and Testing data
+```{r read_files}
+
+# Set working directory (adjust to your path)
+# setwd("your/folder/path")
+# Read the training data
+train_data <- read_excel("StudentData.xlsx")
+test_data <- read_excel("StudentEvaluation.xlsx")
+
+
+```
+### Training Data 
+
+```{r training_dataset}
+# Check structure of training data
+cat("=== TRAINING DATA ===\n")
+cat("Dimensions:", dim(train_data), "\n")
+cat("\nColumn names:\n")
+print(names(train_data))
+cat("\nFirst few rows:\n")
+print(head(train_data,3))
+cat("\nSummary of training data:\n")
+print(summary(train_data))
+```
+
+**Key Insights from Training Data:**
+
+- pH is numeric in training data (range: 7.88 to 9.36, mean ~8.55) — this is our target variable
+
+- Dataset have missing values that need handling before modeling
+
+- 33 predictor variables available (excluding Brand Code which is categorical)
+
+### Test Data 
+
+```{r test_dataset}
+cat("\n\n=== TEST DATA ===\n")
+cat("Dimensions:", dim(test_data), "\n")
+cat("\nColumn names:\n")
+print(names(test_data))
+cat("\nFirst few rows:\n")
+print(head(test_data,3))
+cat("\nSummary of test data:\n")
+print(summary(test_data))
+```
+
+### Check missing values
+```{r check_missingness}
+# Check for missing values in both datasets
+cat("\n=== MISSING VALUES ===\n")
+cat("Training data missing values per column:\n")
+print(colSums(is.na(train_data)))
+cat("\nTest data missing values per column:\n")
+print(colSums(is.na(test_data)))
+```
+
+## Problem Understanding
+
+### Business Goal:
+ABC Beverage need to comply with new regulations requiring you to:
+
+- Understand your manufacturing process and which factors predict pH
+- Report a predictive model for pH to leadership
+
+### Data Situation:
+
+- **Training data (StudentData.xlsx):** Has historical manufacturing measurements INCLUDING pH values (it contains pH as numeric)
+- **Test data (StudentEvaluation.xlsx):** Has the SAME manufacturing measurements BUT pH is empty/logical (all NA values) — this is what we need to predict
+
+**Challenge:** Missing values in BOTH datasets across many columns (Brand Code has 120 NAs in training, MFR has 212 NAs, etc.)
+
+## Data preprocessing
+
+```{r preprocessing}
+# Create a copy for preprocessing
+train_clean <- train_data
+test_clean <- test_data
+
+# IDENTIFY COLUMN TYPES
+cat("=== COLUMN TYPES IN TRAINING ===\n")
+col_types <- sapply(train_clean, class)
+print(table(col_types))
+
+# Separate features and target in training
+# Remove rows where PH is missing (only 4 NAs in training)
+train_clean <- train_clean %>% filter(!is.na(PH))
+cat("\nTraining rows after removing NA in PH:", nrow(train_clean), "\n")
+
+# For test data, PH is all NA - we'll keep it as placeholder
+# But we need to ensure test has same structure as training features
+
+# Handle Brand Code as factor (categorical)
+train_clean$`Brand Code` <- as.factor(train_clean$`Brand Code`)
+test_clean$`Brand Code` <- as.factor(test_clean$`Brand Code`)
+
+# Check levels match
+cat("\nBrand Code levels in training:", levels(train_clean$`Brand Code`), "\n")
+cat("Brand Code levels in test:", levels(test_clean$`Brand Code`), "\n")
+
+# MISSING VALUE ANALYSIS
+cat("\n=== MISSING VALUE SUMMARY ===\n")
+missing_train <- sort(colSums(is.na(train_clean)), decreasing = TRUE)
+missing_train <- missing_train[missing_train > 0]
+cat("Columns with missing values in training:\n")
+print(missing_train)
+
+# Identify columns with >30% missing in training
+high_missing <- names(missing_train[missing_train > 0.3 * nrow(train_clean)])
+cat("\nColumns with >30% missing:", high_missing, "\n")
+
+# For now, let's remove columns with >50% missing
+threshold <- 0.5 * nrow(train_clean)
+cols_to_remove <- names(missing_train[missing_train > threshold])
+cat("Columns to remove (>50% missing):", cols_to_remove, "\n")
+
+# Remove these columns from both datasets
+if(length(cols_to_remove) > 0) {
+  train_clean <- train_clean %>% select(-one_of(cols_to_remove))
+  test_clean <- test_clean %>% select(-one_of(cols_to_remove))
+}
+```
+### Handle Missing Data with Imputation
+
+```{r imputing}
+
+# For remaining missing values, use median/mode imputation
+# Separate numeric and character columns
+numeric_cols <- names(train_clean)[sapply(train_clean, is.numeric)]
+factor_cols <- names(train_clean)[sapply(train_clean, is.factor)]
+
+# Impute numeric columns with median
+for(col in numeric_cols) {
+  if(any(is.na(train_clean[[col]]))) {
+    med_val <- median(train_clean[[col]], na.rm = TRUE)
+    train_clean[[col]][is.na(train_clean[[col]])] <- med_val
+  }
+  if(any(is.na(test_clean[[col]]))) {
+    med_val <- median(test_clean[[col]], na.rm = TRUE)
+    test_clean[[col]][is.na(test_clean[[col]])] <- med_val
+  }
+}
+
+# Impute factor columns with mode
+for(col in factor_cols) {
+  if(any(is.na(train_clean[[col]]))) {
+    mode_val <- names(sort(table(train_clean[[col]]), decreasing = TRUE))[1]
+    train_clean[[col]][is.na(train_clean[[col]])] <- mode_val
+  }
+  if(any(is.na(test_clean[[col]]))) {
+    mode_val <- names(sort(table(test_clean[[col]]), decreasing = TRUE))[1]
+    test_clean[[col]][is.na(test_clean[[col]])] <- mode_val
+  }
+}
+
+# Verify no missing values remain
+cat("\n=== MISSING VALUES AFTER CLEANING ===\n")
+cat("Training:", sum(is.na(train_clean)), "\n")
+cat("Test:", sum(is.na(test_clean)), "\n")
+```
+
+#### Summary of handling missing values
+
+- **Removed target variable NAs:** Dropped 4 rows from training where pH was missing, leaving 2,567 complete training records
+
+- **Handled missing values in predictors:** Imputed numeric columns with median values and categorical (Brand Code) with mode; no columns exceeded 50% missing, so all 33 original features were retained
+
+- **Aligned datasets:** Ensured both training and test data have identical structure with same 33 columns and matching factor levels (A, B, C, D for Brand Code)
+
+
+
+### Outliers and Anomalies Detection
+
+
+```{r outliers}
+
+# Ensure factor
+train_clean$Brand_Code <- as.factor(train_clean$'Brand Code')
+test_clean$Brand_Code <- as.factor(test_clean$'Brand Code')
+
+# 1. OUTLIER DETECTION using IQR method
+cat("=== OUTLIER ANALYSIS ===\n")
+
+# Get numeric columns (exclude Brand Code and PH)
+numeric_cols <- names(train_clean)[sapply(train_clean, is.numeric)]
+numeric_cols <- numeric_cols[!numeric_cols %in% c("PH")]
+
+outlier_summary <- data.frame(
+  Variable = character(),
+  Outliers_Count = integer(),
+  Outliers_Percent = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for(col in numeric_cols) {
+  Q1 <- quantile(train_clean[[col]], 0.25, na.rm = TRUE)
+  Q3 <- quantile(train_clean[[col]], 0.75, na.rm = TRUE)
+  IQR <- Q3 - Q1
+  lower_bound <- Q1 - 1.5 * IQR
+  upper_bound <- Q3 + 1.5 * IQR
+  
+  outliers <- sum(train_clean[[col]] < lower_bound | train_clean[[col]] > upper_bound, na.rm = TRUE)
+  outlier_pct <- (outliers / nrow(train_clean)) * 100
+  
+  outlier_summary <- rbind(outlier_summary, 
+                           data.frame(Variable = col, 
+                                      Outliers_Count = outliers, 
+                                      Outliers_Percent = round(outlier_pct, 2)))
+}
+
+# Show top 10 variables with most outliers
+outlier_summary <- outlier_summary[order(-outlier_summary$Outliers_Percent), ]
+cat("\nTop 10 variables with highest outlier percentage:\n")
+print(head(outlier_summary, 10))
+```
+
+#### Data Quality Findings
+
+#### Top 3 variables with most outliers:
+
+- Filler Speed - 17.1% outliers (440 out of 2,567 rows)
+- MFR - 10.9% outliers (279 rows)
+- Air Pressurer - 8.6% outliers (220 rows)
+
+**Key insight:** These are not data entry errors — they represent legitimate manufacturing variation. Filler speed extremes likely occur during production ramp-up/down or different product runs.
+
+#### Recommendation
+
+**Lets Keep outliers but we will document them. Why?
+
+- Manufacturing processes naturally have extreme values (startup, shutdown, different brands)
+
+- Removing 17% of data would bias our model
+
+- These extremes help predict pH across full operating range
+
+### Check Negative and zero values
+
+```{r check_impossible}
+# 2. CHECK FOR IMPOSSIBLE/NONSENSICAL VALUES
+cat("\n=== LOGICAL CONSISTENCY CHECKS ===\n")
+
+# Check for negative pressures (should be impossible)
+pressure_cols <- grep("Pressure", names(train_clean), value = TRUE)
+for(col in pressure_cols) {
+  negatives <- sum(train_clean[[col]] < 0, na.rm = TRUE)
+  if(negatives > 0) {
+    cat(col, ": ", negatives, "negative values (range:", min(train_clean[[col]]), "to", max(train_clean[[col]]), ")\n")
+  }
+}
+
+# Check for zero or negative in volume/flow measurements
+volume_cols <- c("Carb.Volume", "Fill.Ounces", "PC.Volume", "Carb.Flow")
+for(col in volume_cols) {
+  if(col %in% names(train_clean)) {
+    zeros_or_neg <- sum(train_clean[[col]] <= 0, na.rm = TRUE)
+    if(zeros_or_neg > 0) {
+      cat(col, ": ", zeros_or_neg, "values <= 0\n")
+    }
+  }
+}
+
+# 3. CHECK DATA TYPES AND FORMATS
+cat("\n=== DATA TYPE VERIFICATION ===\n")
+cat("pH range in training:", range(train_clean$PH), "\n")
+cat("pH should be between 0-14. All values valid:", 
+    all(train_clean$PH >= 0 & train_clean$PH <= 14), "\n")
+
+# Check for duplicate rows
+duplicates <- sum(duplicated(train_clean[, !names(train_clean) %in% "PH"]))
+cat("Duplicate rows (excluding pH):", duplicates, "\n")
+```
+
+#### Key Findings from Quality Checks
+
+**Negative values detected :**
+
+- Hyd Pressure1: 38 negative values (down to -0.8)
+
+- Hyd Pressure3: 70 negative values (down to -1.2)
+
+_ Pressure Vacuum: ALL values negative (-6.6 to -3.6) — this is correct (vacuum = negative pressure)
+
+*No duplicate rows — data is clean*
+
+pH range: 7.88 to 9.36 (normal for beverages)
+
+
+
+### Save clean Datasets
+
+```{r save_cleanData}
+# Save cleaned data
+write.csv(train_clean, "training_data_cleaned.csv", row.names = FALSE)
+write.csv(test_clean, "test_data_cleaned.csv", row.names = FALSE)
+
+cat("\n=== CLEANING COMPLETE ===\n")
+cat("Final training dimensions:", dim(train_clean), "\n")
+cat("Final test dimensions:", dim(test_clean), "\n")
+```
+
+## Exploratory Data Analysis
+
+### Correlation Matrix for pH Prediction
+
+```{r eda_corr}
+# EDA: Correlation Matrix for pH Prediction
+
+# Ensure Brand Code is factor
+train_clean$`Brand Code` <- as.factor(train_clean$`Brand Code`)
+
+# Calculate correlations with pH
+numeric_cols <- names(train_clean)[sapply(train_clean, is.numeric)]
+target_correlations <- data.frame(
+  Variable = character(),
+  Correlation = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for(col in numeric_cols) {
+  if(col != "PH") {
+    cor_val <- cor(train_clean[[col]], train_clean$PH, use = "complete.obs")
+    target_correlations <- rbind(target_correlations, 
+                                  data.frame(Variable = col, 
+                                             Correlation = round(cor_val, 3)))
+  }
+}
+
+# Sort by absolute correlation
+target_correlations <- target_correlations[order(-abs(target_correlations$Correlation)), ]
+
+cat("=== TOP 15 VARIABLES MOST CORRELATED WITH pH ===\n")
+print(head(target_correlations, 15))
+
+# Create correlation matrix for top variables
+top_vars <- head(target_correlations$Variable, 15)
+top_vars <- c(top_vars, "PH")
+cor_matrix <- cor(train_clean[, top_vars], use = "complete.obs")
+
+# Visualize correlation matrix
+corrplot(cor_matrix, 
+         method = "color", 
+         type = "upper",
+         tl.cex = 0.8,
+         tl.col = "black",
+         title = "Top 15 Variable Correlations with pH",
+         mar = c(0,0,2,0))
+
+# Bar plot of top correlations with pH
+ggplot(head(target_correlations, 15), aes(x = reorder(Variable, abs(Correlation)), 
+                                            y = Correlation, 
+                                            fill = Correlation > 0)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Top 15 Factors Correlated with pH",
+       x = "Process Variables",
+       y = "Correlation with pH") +
+  theme_minimal() +
+  scale_fill_manual(values = c("darkred", "darkgreen"), 
+                    labels = c("Negative", "Positive"),
+                    name = "Direction")
+
+# Summary statistics for top 3 predictors vs pH
+top_3 <- head(target_correlations$Variable, 3)
+cat("\n=== TOP 3 PREDICTORS SUMMARY ===\n")
+for(var in top_3) {
+  cat("\n", var, "(Correlation:", target_correlations[target_correlations$Variable == var, "Correlation"], ")\n")
+  print(summary(train_clean[[var]]))
+}
+```
+
+#### Correlation Analysis Findings
+
+#### Top pH Predictors Identified:
+
+- **Mnf Flow (Manufacturing Flow):** Strongest negative correlation (-0.447) — Higher flow rates = Lower pH
+
+- **Bowl Setpoint:** Strong positive correlation (0.349) — Higher setpoint = Higher pH
+
+- **Filler Level:** Moderate positive correlation (0.322) — Higher fill level = Higher pH
+
+- **Usage cont:** Negative correlation (-0.318) — More usage = Lower pH
+
+- **Pressure Setpoint:** Negative correlation (-0.306) — Higher pressure = Lower pH
+
+
+**Key Insight:** Manufacturing flow rate (Mnf Flow) is the single most important factor controlling pH, followed by bowl setpoint and filler level.
+
+### Brand Analysis
+
+```{r bradn_analysis}
+# EDA: Brand Analysis - Does pH differ by brand?
+
+
+# Calculate pH statistics by brand
+brand_stats <- train_clean %>%
+  group_by(`Brand Code`) %>%
+  summarise(
+    Count = n(),
+    Mean_pH = round(mean(PH), 3),
+    SD_pH = round(sd(PH), 3),
+    Min_pH = round(min(PH), 3),
+    Max_pH = round(max(PH), 3),
+    .groups = 'drop'
+  )
+
+cat("=== PH STATISTICS BY BRAND ===\n")
+print(brand_stats)
+
+# ANOVA test to check if brand differences are significant
+anova_result <- aov(PH ~ `Brand Code`, data = train_clean)
+cat("\n=== ANOVA RESULTS ===\n")
+print(summary(anova_result))
+
+# Visualization: Boxplot of pH by brand
+ggplot(train_clean, aes(x = `Brand Code`, y = PH, fill = `Brand Code`)) +
+  geom_boxplot() +
+  labs(title = "pH Distribution by Brand Code",
+       x = "Brand",
+       y = "pH Level") +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set2") +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 3, color = "red")
+
+# Visualization: Density plot
+ggplot(train_clean, aes(x = PH, fill = `Brand Code`)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "pH Density Distribution by Brand",
+       x = "pH",
+       y = "Density") +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set2")
+```
+
+#### Brand Analysis Summary
+
+- **Significant pH differences across brands (p-value < 0.001)** — Brand D has highest pH (8.60), Brand C lowest (8.41)
+
+- **Brand B** has largest volume (1,355 batches) and wide pH range (8.00 to 8.94)
+
+- **Brand C** shows most variation (SD = 0.177) with extreme values (7.88 to 9.36)
+
+### Interaction Effects
+
+```{r Interaction_Effects}
+# EDA: Interaction Effects - Do combinations of factors predict pH better?
+
+# Interaction plot: Mnf Flow × Brand on pH
+ggplot(train_clean, aes(x = `Mnf Flow`, y = PH, color = `Brand Code`)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Interaction: Manufacturing Flow × Brand on pH",
+       x = "Manufacturing Flow (Mnf Flow)",
+       y = "pH",
+       color = "Brand") +
+  theme_minimal()
+
+# Check interaction: Bowl Setpoint × Filler Level
+ggplot(train_clean, aes(x = `Bowl Setpoint`, y = PH, color = `Filler Level`)) +
+  geom_point(alpha = 0.4) +
+  scale_color_gradient(low = "blue", high = "red") +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  labs(title = "Interaction: Bowl Setpoint × Filler Level on pH",
+       x = "Bowl Setpoint",
+       y = "pH",
+       color = "Filler Level") +
+  theme_minimal()
+
+# Calculate interaction strength
+model_main <- lm(PH ~ `Mnf Flow` + `Brand Code`, data = train_clean)
+model_interaction <- lm(PH ~ `Mnf Flow` * `Brand Code`, data = train_clean)
+
+cat("=== INTERACTION EFFECT SIGNIFICANCE ===\n")
+cat("Main effects R²:", round(summary(model_main)$r.squared, 4), "\n")
+cat("With interaction R²:", round(summary(model_interaction)$r.squared, 4), "\n")
+cat("Improvement:", round(summary(model_interaction)$r.squared - summary(model_main)$r.squared, 4), "\n")
+
+# ANOVA to test if interaction is significant
+anova_compare <- anova(model_main, model_interaction)
+print(anova_compare)
+```
+
+#### Interaction Effects Summary
+
+- **Interaction improves prediction by 1.8% (R² from 0.305 to 0.323) —** statistically significant (p < 0.001)
+- **Brand affects how Mnf Flow influences pH —** relationship differs across brands A, B, C, D
+- **Need to include Brand in final model —** ignoring it reduces accuracy
+
+### pH Distribution Check
+
+```{r pH_skewness_check}
+# EDA: Skewness Check for pH
+
+# Load library
+library(e1071)
+
+# Calculate skewness
+skew_value <- skewness(train_clean$PH)
+cat("Skewness of pH:", round(skew_value, 4), "\n")
+
+# Interpretation rules of thumb
+if(abs(skew_value) < 0.5) {
+  cat("Interpretation: Approximately symmetric\n")
+} else if(abs(skew_value) < 1) {
+  cat("Interpretation: Moderately skewed\n")
+} else {
+  cat("Interpretation: Highly skewed\n")
+}
+
+# Quick visual: Simple histogram
+hist(train_clean$PH, 
+     main = "pH Distribution", 
+     xlab = "pH",
+     col = "lightblue",
+     border = "black",
+     breaks = 20)
+
+# Add vertical line at mean
+abline(v = mean(train_clean$PH), col = "red", lwd = 2, lty = 2)
+
+# Show mean vs median
+cat("\nMean:", round(mean(train_clean$PH), 4))
+cat("\nMedian:", round(median(train_clean$PH), 4))
+cat("\nDifference:", round(mean(train_clean$PH) - median(train_clean$PH), 4))
+```
+
+#### Skewness Summary
+
+- **pH is approximately symmetric** (skewness = -0.29, well within ±0.5 range)
+
+- **Mean and median are nearly identical** (8.5456 vs 8.5400, difference only 0.0056)
+
+- **Linear regression is viable** — no severe skewness requiring transformation
+
+
+### Multicollinearity Check
+
+```{r}
+# EDA Multicollinearity - Are top predictors correlated with each other?
+
+
+# Select top 10 predictors from earlier correlation analysis
+top_predictors <- c("Mnf Flow", "Bowl Setpoint", "Filler Level", "Usage cont", 
+                    "Pressure Setpoint", "Hyd Pressure3", "Pressure Vacuum", 
+                    "Fill Pressure", "Hyd Pressure2", "Oxygen Filler")
+
+# Create correlation matrix for top predictors
+cor_matrix_top <- cor(train_clean[, top_predictors], use = "complete.obs")
+
+# Visualize
+corrplot::corrplot(cor_matrix_top, 
+                   method = "number", 
+                   type = "upper",
+                   tl.cex = 0.8,
+                   title = "Multicollinearity Among Top Predictors",
+                   mar = c(0,0,2,0))
+
+# Calculate VIF (Variance Inflation Factor)
+# Build linear model with all top predictors
+vif_model <- lm(PH ~ `Mnf Flow` + `Bowl Setpoint` + `Filler Level` + `Usage cont` + 
+                      `Pressure Setpoint` + `Hyd Pressure3` + `Pressure Vacuum` + 
+                      `Fill Pressure` + `Hyd Pressure2` + `Oxygen Filler`, 
+                data = train_clean)
+
+vif_values <- vif(vif_model)
+
+cat("=== VARIANCE INFLATION FACTOR (VIF) ===\n")
+cat("Rule of thumb: VIF > 5 indicates high multicollinearity\n")
+cat("VIF > 10 indicates severe multicollinearity\n\n")
+
+print(data.frame(Variable = names(vif_values), VIF = round(vif_values, 2)))
+
+# Check if any VIF > 5
+high_vif <- names(vif_values[vif_values > 5])
+if(length(high_vif) > 0) {
+  cat("\n High multicollinearity detected for:", paste(high_vif, collapse = ", "), "\n")
+  cat("Recommendation: Remove or combine these variables\n")
+} else {
+  cat("\n No concerning multicollinearity (all VIF < 5)\n")
+  cat("All top predictors can be used together\n")
+}
+```
+
+#### Multicollinearity Summary
+
+- **High correlation detected** — Bowl Setpoint (VIF 8.8), Filler Level (8.85), Hyd Pressure3 (10.72), Hyd Pressure2 (7.62) are redundant
+- **Impact on modeling** — These variables measure similar process conditions; keeping all causes unstable coefficient estimates
+- **Recommendation** — Select representative variables (e.g., keep Filler Level, drop Hyd Pressure2/3) or use tree-based models (Random Forest/XGBoost) which handle redundancy naturally
+
+
+### Non-linear Relationships
+
+```{r Check_for_non-linear_relationships}
+# EDA: Check for non-linear relationships with pH
+
+
+# Top 3 predictors vs pH with LOESS smooth curves
+p1 <- ggplot(train_clean, aes(x = `Mnf Flow`, y = PH)) +
+  geom_point(alpha = 0.3, size = 0.8) +
+  geom_smooth(method = "loess", color = "red", se = TRUE) +
+  geom_smooth(method = "lm", color = "blue", linetype = "dashed", se = FALSE) +
+  labs(title = "Mnf Flow vs pH",
+       x = "Manufacturing Flow",
+       y = "pH") +
+  theme_minimal()
+
+p2 <- ggplot(train_clean, aes(x = `Bowl Setpoint`, y = PH)) +
+  geom_point(alpha = 0.3, size = 0.8) +
+  geom_smooth(method = "loess", color = "red", se = TRUE) +
+  geom_smooth(method = "lm", color = "blue", linetype = "dashed", se = FALSE) +
+  labs(title = "Bowl Setpoint vs pH",
+       x = "Bowl Setpoint",
+       y = "pH") +
+  theme_minimal()
+
+p3 <- ggplot(train_clean, aes(x = `Filler Level`, y = PH)) +
+  geom_point(alpha = 0.3, size = 0.8) +
+  geom_smooth(method = "loess", color = "red", se = TRUE) +
+  geom_smooth(method = "lm", color = "blue", linetype = "dashed", se = FALSE) +
+  labs(title = "Filler Level vs pH",
+       x = "Filler Level",
+       y = "pH") +
+  theme_minimal()
+
+# Arrange plots
+library(gridExtra)
+grid.arrange(p1, p2, p3, ncol = 3)
+
+# Quick check: Is linear model sufficient?
+model_linear <- lm(PH ~ `Mnf Flow`, data = train_clean)
+model_poly <- lm(PH ~ poly(`Mnf Flow`, 2), data = train_clean)
+
+cat("=== LINEAR vs POLYNOMIAL COMPARISON ===\n")
+cat("Linear R²:", round(summary(model_linear)$r.squared, 4), "\n")
+cat("Polynomial (degree 2) R²:", round(summary(model_poly)$r.squared, 4), "\n")
+
+if(summary(model_poly)$r.squared - summary(model_linear)$r.squared > 0.01) {
+  cat("\n Non-linear pattern detected - polynomial improves fit by >1%\n")
+} else {
+  cat("\n Relationships are approximately linear\n")
+}
+```
+
+### Non-linear Relationships Summary
+
+- **Non-linear patterns detected** — Polynomial model improves R² by 1.5% (0.200 to 0.215) for Mnf Flow vs pH
+- **Practical implication** — Simple linear regression may underfit; tree-based models (Random Forest, XGBoost) capture these curves automatically
+- **Final recommendation** — Use ensemble methods that handle both non-linearity and multicollinearity without manual feature selection
+
+
+# Next Step Modeling 
+
+Linear Regression (baseline)
+Random Forest (handles non-linearity)
+XGBoost (handles interactions)
+
+### Modeling section is performed by Sachi Kapoor
+
+- Part 2: model implementation
+- Part 3: testing the models and showing the results
+
+The two cleaned files used here are:
+
+- `training_data_cleaned.csv`
+- `test_data_cleaned.csv`
+
+From the earlier EDA, we already know two things:
+
+1. Brand matters and should stay in the modeling process.
+2. pH is not strongly skewed, so I am not going to log transform the target unless there is a strong reason to do that later.
+
+
+## Load the cleaned data
+
+```{r load-data}
+train_clean <- read.csv("training_data_cleaned.csv", check.names = FALSE)
+test_clean  <- read.csv("test_data_cleaned.csv", check.names = FALSE)
+
+cat("Training rows:", nrow(train_clean), "\n")
+cat("Training columns:", ncol(train_clean), "\n")
+cat("Test rows:", nrow(test_clean), "\n")
+cat("Test columns:", ncol(test_clean), "\n")
+```
+
+## Make the column names model-friendly
+
+One issue with this dataset is that several variable names have spaces in them, like `Brand Code` and `Mnf Flow`.
+
+That is fine for basic viewing, but some modeling functions, especially the tree model through `caret`, can be picky about column names. To avoid that problem, I am standardizing the names once at the start. This does **not** change the data itself. It only makes the variable names easier for R to work with.
+
+```{r clean-column-names}
+original_names <- names(train_clean)
+safe_names <- make.names(original_names, unique = TRUE)
+
+names(train_clean) <- safe_names
+names(test_clean)  <- make.names(names(test_clean), unique = TRUE)
+
+name_key <- data.frame(
+  Original_Name = original_names,
+  Modeling_Name = safe_names
+)
+
+kable(name_key, caption = "Original variable names and model-friendly names")
+```
+
+## Prepare the data
+
+```{r prepare-data}
+# Remove duplicate brand column if both versions exist
+if ("Brand_Code" %in% names(train_clean)) {
+  train_clean <- train_clean %>% select(-Brand_Code)
+}
+
+if ("Brand_Code" %in% names(test_clean)) {
+  test_clean <- test_clean %>% select(-Brand_Code)
+}
+
+# Keep only rows with a known target in training
+train_clean <- train_clean %>% filter(!is.na(PH))
+
+# Convert Brand.Code to factor
+train_clean$Brand.Code <- as.factor(train_clean$Brand.Code)
+test_clean$Brand.Code  <- as.factor(test_clean$Brand.Code)
+
+# Match factor levels between training and test data
+all_levels <- union(levels(train_clean$Brand.Code), levels(test_clean$Brand.Code))
+train_clean$Brand.Code <- factor(train_clean$Brand.Code, levels = all_levels)
+test_clean$Brand.Code  <- factor(test_clean$Brand.Code, levels = all_levels)
+
+# Split into training and validation sets
+set.seed(42)
+train_index <- createDataPartition(train_clean$PH, p = 0.80, list = FALSE)
+train_set <- train_clean[train_index, ]
+valid_set <- train_clean[-train_index, ]
+
+cat("Modeling train rows:", nrow(train_set), "\n")
+cat("Validation rows:", nrow(valid_set), "\n")
+```
+
+## Check missing values
+
+```{r missing-summary}
+missing_train <- sort(colSums(is.na(train_set)), decreasing = TRUE)
+missing_train <- missing_train[missing_train > 0]
+missing_train
+```
+
+## Handle missing values
+
+Instead of using automatic imputation inside every model call, I am filling the missing values first. This makes the modeling steps more stable and easier to follow.
+
+For `Brand.Code`, I use the most common category in the training set.
+
+For numeric predictors, I use median imputation based on the training set.
+
+```{r manual-imputation}
+# Fill missing Brand.Code with the most common value
+mode_brand <- names(sort(table(train_set$Brand.Code), decreasing = TRUE))[1]
+
+train_set$Brand.Code[is.na(train_set$Brand.Code)] <- mode_brand
+valid_set$Brand.Code[is.na(valid_set$Brand.Code)] <- mode_brand
+test_clean$Brand.Code[is.na(test_clean$Brand.Code)] <- mode_brand
+
+# Median imputation for numeric predictors
+numeric_cols <- names(train_set)[sapply(train_set, is.numeric)]
+numeric_predictors <- setdiff(numeric_cols, "PH")
+
+for (col in numeric_predictors) {
+  med_value <- median(train_set[[col]], na.rm = TRUE)
+  train_set[[col]][is.na(train_set[[col]])] <- med_value
+  valid_set[[col]][is.na(valid_set[[col]])] <- med_value
+  test_clean[[col]][is.na(test_clean[[col]])] <- med_value
+}
+
+# Also complete the full training set for the final model
+train_clean$Brand.Code[is.na(train_clean$Brand.Code)] <- mode_brand
+
+for (col in numeric_predictors) {
+  med_value <- median(train_set[[col]], na.rm = TRUE)
+  train_clean[[col]][is.na(train_clean[[col]])] <- med_value
+}
+
+# Quick check
+colSums(is.na(train_set))
+```
+
+## Check the shape of the target
+
+```{r skewness-check}
+skew_value <- e1071::skewness(train_clean$PH)
+cat("Skewness of PH:", round(skew_value, 4), "\n")
+```
+
+Since the skewness is close to zero, I kept the target on its original scale.
+
+## Modeling plan
+
+I am testing five different models:
+
+1. Linear Regression
+2. Ridge Regression
+3. Decision Tree
+4. Random Forest
+5. Gradient Boosting
+
+This gives a mix of simpler models and more flexible nonlinear models.
+
+```{r train-control}
+ctrl <- trainControl(
+  method = "cv",
+  number = 5
+)
+```
+
+## Model 1: Linear Regression
+
+```{r linear-model}
+set.seed(42)
+model_lm <- train(
+  PH ~ .,
+  data = train_set,
+  method = "lm",
+  trControl = ctrl
+)
+model_lm
+```
+
+## Model 2: Ridge Regression
+
+```{r ridge-model}
+set.seed(42)
+model_ridge <- train(
+  PH ~ .,
+  data = train_set,
+  method = "glmnet",
+  trControl = ctrl,
+  preProcess = c("center", "scale"),
+  tuneGrid = expand.grid(
+    alpha = 0,
+    lambda = seq(0.0001, 1, length = 20)
+  )
+)
+model_ridge
+```
+
+## Model 3: Decision Tree
+
+```{r tree-model}
+set.seed(42)
+model_tree <- train(
+  x = subset(train_set, select = -PH),
+  y = train_set$PH,
+  method = "rpart",
+  trControl = ctrl,
+  tuneLength = 10
+)
+model_tree
+```
+
+```{r tree-plot, fig.width=10, fig.height=6}
+rpart.plot(model_tree$finalModel, main = "Decision Tree for pH Prediction")
+```
+
+## Model 4: Random Forest
+
+```{r rf-model}
+set.seed(42)
+model_rf <- train(
+  PH ~ .,
+  data = train_set,
+  method = "rf",
+  trControl = ctrl,
+  tuneLength = 5,
+  importance = TRUE,
+  ntree = 300
+)
+model_rf
+```
+
+## Model 5: Gradient Boosting
+
+```{r gbm-model}
+set.seed(42)
+model_gbm <- train(
+  PH ~ .,
+  data = train_set,
+  method = "gbm",
+  trControl = ctrl,
+  verbose = FALSE,
+  tuneLength = 5
+)
+model_gbm
+```
+
+## Make validation predictions
+
+```{r predictions}
+pred_lm    <- predict(model_lm, valid_set)
+pred_ridge <- predict(model_ridge, valid_set)
+pred_tree  <- predict(model_tree, subset(valid_set, select = -PH))
+pred_rf    <- predict(model_rf, valid_set)
+pred_gbm   <- predict(model_gbm, valid_set)
+```
+
+## Compare model performance
+
+I used RMSE, MAE, and R-squared to compare the models on the validation set.
+
+```{r results-table}
+get_metrics <- function(actual, predicted, model_name) {
+  data.frame(
+    Model = model_name,
+    RMSE = RMSE(predicted, actual),
+    MAE  = MAE(predicted, actual),
+    R2   = R2(predicted, actual)
+  )
+}
+
+results_table <- bind_rows(
+  get_metrics(valid_set$PH, pred_lm, "Linear Regression"),
+  get_metrics(valid_set$PH, pred_ridge, "Ridge Regression"),
+  get_metrics(valid_set$PH, pred_tree, "Decision Tree"),
+  get_metrics(valid_set$PH, pred_rf, "Random Forest"),
+  get_metrics(valid_set$PH, pred_gbm, "Gradient Boosting")
+) %>%
+  arrange(RMSE)
+
+kable(results_table, digits = 4, caption = "Validation performance comparison")
+```
+
+## Best model
+
+```{r best-model}
+best_model_name <- results_table$Model[1]
+cat("Best model based on validation RMSE:", best_model_name, "\n")
+```
+
+## Variable importance
+
+Even though I tested several models, Random Forest is especially useful because it can also show which predictors mattered most.
+
+```{r variable-importance}
+rf_importance <- varImp(model_rf)
+rf_importance_df <- rf_importance$importance %>%
+  rownames_to_column("Feature") %>%
+  arrange(desc(Overall))
+
+kable(head(rf_importance_df, 12), digits = 4, caption = "Top 12 important predictors from Random Forest")
+```
+
+```{r importance-plot, fig.width=10, fig.height=7}
+plot(varImp(model_rf), top = 12, main = "Random Forest Variable Importance")
+```
+
+### Refit the final model on all training data
+
+After comparing the models, I refit the final model using all available training rows with known pH.
+
+```{r final-model}
+set.seed(42)
+final_model <- train(
+  PH ~ .,
+  data = train_clean,
+  method = "rf",
+  trControl = ctrl,
+  tuneGrid = model_rf$bestTune,
+  importance = TRUE,
+  ntree = 300
+)
+final_model
+```
+
+### Predict pH for the evaluation data
+
+```{r final-predictions}
+final_predictions <- predict(final_model, test_clean)
+
+prediction_output <- test_clean %>%
+  mutate(
+    Predicted_PH_Final_Model = round(final_predictions, 4),
+    Final_Model = "Random Forest",
+    Prediction_Note = "PH was blank in evaluation file, so the final model prediction is provided here."
+  )
+
+summary(prediction_output$Predicted_PH_Final_Model)
+```
+
+#### Save the output files
+
+```{r save-output}
+write.csv(results_table, "model_validation_results.csv", row.names = FALSE)
+write.csv(rf_importance_df, "random_forest_variable_importance.csv", row.names = FALSE)
+write.csv(prediction_output, "ABC_Beverage_PH_Predictions.csv", row.names = FALSE)
+```
+
+### Final thoughts
+
+```{r interpretation, results='asis'}
+cat("Based on the validation results, I selected the model with the lowest RMSE as the final model. ")
+cat("In this type of manufacturing data, tree-based models are often helpful because they can capture nonlinear patterns and interactions that a basic linear model may miss. ")
+cat("That is especially relevant here because earlier analysis already suggested that Brand Code changes the relationship between Mnf Flow and pH.\n\n")
+
+cat("The final prediction file created by this report is **ABC_Beverage_PH_Predictions.csv**. ")
+cat("This file can be turned in as the model prediction output for the evaluation dataset.\n")
+```
+
+#### Write all predictions on excel file 
+```{r}
+# Write all predictions on excel file  
+# ============================================================
+# Step 1: Read all your actual data files
+# ============================================================
+
+# Read the predictions CSV (test data with predictions)
+predictions_raw <- read_csv("ABC_Beverage_PH_Predictions.csv")
+
+# Read the model comparison results
+model_results <- results_table # Your 5-model comparison
+
+# Read the random forest variable importance
+rf_importance <- read_csv("random_forest_variable_importance.csv")  # Your 34-feature importance
+
+# ============================================================
+# Extract actual metrics
+# ============================================================
+
+rf_metrics <- results_table %>% filter(Model == "Random Forest")
+RMSE_actual <- rf_metrics$RMSE
+R2_actual <- rf_metrics$R2
+
+# 90% prediction interval (z = 1.645)
+PI_width <- round(1.645 * RMSE_actual, 4)
+
+# ============================================================
+# Sheet 1: Predictions (main output)
+# ============================================================
+
+predictions_df <- predictions_raw %>%
+  mutate(
+    RowID = row_number(),
+    PH_Predicted = Predicted_PH_Final_Model,
+    PH_Lower_90CI = PH_Predicted - (1.645 * RMSE_actual),
+    PH_Upper_90CI = PH_Predicted + (1.645 * RMSE_actual),
+    Alert_Flag = case_when(
+      PH_Predicted < 8.2 ~ "LOW - Review",
+      PH_Predicted > 8.9 ~ "HIGH - Review",
+      TRUE ~ "OK"
+    )
+  ) %>%
+  select(RowID, Brand_Code = `Brand.Code`, Mnf.Flow, Bowl.Setpoint, 
+         Filler.Level, PH_Predicted, PH_Lower_90CI, PH_Upper_90CI, 
+         Alert_Flag, Final_Model)
+
+# ============================================================
+# Sheet 2: Model Metadata
+# ============================================================
+
+metadata_df <- data.frame(
+  Metric = c("Model", "RMSE", "R_Squared", "Prediction_Interval_90%", "Test_Rows"),
+  Value = c("Random Forest", round(RMSE_actual, 4), round(R2_actual, 4), 
+            paste0("±", PI_width), nrow(predictions_raw))
+)
+
+# ============================================================
+# Sheet 3: Variable Importance (from your rf_importance_df)
+# ============================================================
+
+importance_df <- rf_importance_df %>%
+  mutate(Rank = row_number(), Importance = round(Overall, 2)) %>%
+  select(Rank, Variable = Feature, Importance)
+
+# ============================================================
+# Sheet 4: Model Comparison
+# ============================================================
+
+comparison_df <- results_table %>%
+  arrange(RMSE) %>%
+  mutate(across(c(RMSE, MAE, R2), ~ round(., 4))) %>%
+  select(Model, RMSE, MAE, R2)
+
+# ============================================================
+# Sheet 5: Brand Summary
+# ============================================================
+
+brand_df <- predictions_df %>%
+  group_by(Brand_Code) %>%
+  summarise(
+    Count = n(),
+    Avg_pH = round(mean(PH_Predicted), 3),
+    Min_pH = round(min(PH_Predicted), 3),
+    Max_pH = round(max(PH_Predicted), 3),
+    .groups = "drop"
+  )
+
+# ============================================================
+# Sheet 6: Executive Summary (simple)
+# ============================================================
+
+summary_df <- data.frame(
+  Key_Finding = c("Total Predictions", "Model RMSE", "Model R²", "Top Predictor", 
+                  "Lowest pH Brand", "Runs Needing Review"),
+  Value = c(nrow(predictions_df), round(RMSE_actual, 4), round(R2_actual, 4),
+            rf_importance_df$Feature[1],
+            brand_df$Brand_Code[which.min(brand_df$Avg_pH)],
+            sum(predictions_df$Alert_Flag != "OK"))
+)
+
+# ============================================================
+# Write to Excel
+# ============================================================
+
+sheets_list <- list(
+  "Predictions" = predictions_df,
+  "Model_Metadata" = metadata_df,
+  "Variable_Importance" = importance_df,
+  "Model_Comparison" = comparison_df,
+  "Brand_Summary" = brand_df,
+  "Executive_Summary" = summary_df
+)
+
+write_xlsx(sheets_list, "ABC_Beverage_pH_Predictions.xlsx")
+
+```
